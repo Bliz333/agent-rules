@@ -1,0 +1,10 @@
+# macOS
+.DS_Store
+
+# Python
+__pycache__/
+*.pyc
+
+# BEGIN project-docs managed
+.agents/local/
+# END project-docs managed

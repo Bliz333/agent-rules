@@ -1,0 +1,2503 @@
+#!/usr/bin/env python3
+# project-docs: managed-checker-v1
+"""Bootstrap and validate cross-tool project knowledge maps."""
+
+from __future__ import annotations
+
+import argparse
+import ipaddress
+import json
+import os
+import re
+import shlex
+import shutil
+import stat
+import string
+import subprocess
+import sys
+from dataclasses import asdict, dataclass, field
+from pathlib import Path
+from typing import Iterable, Sequence
+from urllib.parse import unquote, urlsplit
+
+
+TOOL_ROOT = Path(__file__).resolve().parent.parent
+TEMPLATE_ROOT = TOOL_ROOT / "project-template"
+AGENT_RULES_HOME_ENV = "AGENT_RULES_HOME"
+DEFAULT_INSTALL_DIRNAME = ".agent-rules"
+
+
+def install_root() -> Path:
+    """Where this rules repo is expected to live when installed for a user."""
+    configured = os.environ.get(AGENT_RULES_HOME_ENV)
+    if configured:
+        return Path(configured).expanduser()
+    return Path.home() / DEFAULT_INSTALL_DIRNAME
+
+
+def display_path(path: Path) -> str:
+    """Render a path with a leading ~ when it lives under the home directory."""
+    try:
+        return "~/" + str(path.relative_to(Path.home()))
+    except ValueError:
+        return str(path)
+
+
+def shell_path(path: Path) -> str:
+    """Render a path for a copy-pasteable shell command.
+
+    ``~/...`` is kept only when the part after ``~`` needs no quoting (so the
+    tilde still expands); anything else becomes a quoted absolute path.
+    """
+    rendered = display_path(path)
+    if rendered.startswith("~/") and shlex.quote(rendered[2:]) == rendered[2:]:
+        return rendered
+    if shlex.quote(rendered) == rendered:
+        return rendered
+    return shlex.quote(str(path))
+
+
+EXCLUDED_DIRS = {
+    ".git",
+    ".idea",
+    ".venv",
+    "build",
+    "coverage",
+    "dist",
+    "node_modules",
+    "target",
+    "tmp",
+    "vendor",
+}
+SOURCE_DIR_NAMES = {
+    "api",
+    "app",
+    "apps",
+    "backend",
+    "client",
+    "cmd",
+    "frontend",
+    "internal",
+    "lib",
+    "mobile",
+    "packages",
+    "server",
+    "services",
+    "src",
+    "web",
+}
+MANIFEST_NAMES = {
+    "Cargo.toml",
+    "go.mod",
+    "package.json",
+    "pom.xml",
+    "pyproject.toml",
+}
+PROTECTED_BRANCHES = {"main", "master", "develop", "trunk"}
+NON_BRANCH_PROSE_WORDS = {
+    "created",
+    "intended",
+    "managed",
+    "required",
+    "used",
+    "using",
+}
+MANAGED_GITIGNORE = (
+    "# BEGIN project-docs managed\n"
+    ".agents/local/\n"
+    "# END project-docs managed\n"
+)
+TEMPLATE_MARKER = "<!-- project-docs: template -->"
+GENERATED_MARKER = "<!-- project-docs: generated -->"
+MANAGED_CHECKER_MARKER = "# project-docs: managed-checker-v1"
+MANAGED_WORKFLOW_MARKER = "# project-docs: managed-workflow-v1"
+MANAGED_CHECKER_PATH = ".github/project-docs/project-docs"
+MANAGED_WORKFLOW_PATH = ".github/workflows/project-docs.yml"
+REMOTE_GATE_NOTICE = (
+    "已安装 GitHub 辅助检查,不构成 required hard gate。首次接入 PR、形似 SHA 的"
+    "分支、非默认 base 及 Merge Queue 均须按独立审查、最终 SHA 锁定与标准 PR 自动收口门槛处理;"
+    "硬门禁需另行配置独立 "
+    "GitHub App 或组织级 required workflow。"
+)
+MANAGED_WORKFLOW_CONTENT = """# project-docs: managed-workflow-v1
+name: project-docs
+
+on:
+  pull_request_target:
+    types: [opened, synchronize, reopened, edited, labeled, unlabeled]
+
+permissions:
+  contents: read
+
+# Advisory only: pull_request_target checks default-branch PRs with default-branch code but its
+# status is not a hard gate on the PR head. Do not configure this job as a required check.
+# Use an independently provisioned GitHub App or organization required workflow when a
+# fail-closed merge gate (including Merge Queue) is required.
+jobs:
+  doctor:
+    if: github.event.action != 'edited' || github.event.changes.base != null
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the repository default branch as PR base
+        env:
+          PR_BASE_REF: ${{ github.event.pull_request.base.ref }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          if [ "$PR_BASE_REF" != "$DEFAULT_BRANCH" ]; then
+            echo "project-docs advisory check supports only the repository default branch" >&2
+            exit 1
+          fi
+      - name: Checkout proposed repository state
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          repository: ${{ github.event.pull_request.head.repo.full_name }}
+          ref: ${{ github.event.pull_request.head.sha }}
+          path: candidate
+          persist-credentials: false
+          allow-unsafe-pr-checkout: true
+      - name: Checkout trusted project-docs gate
+        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+        with:
+          ref: ${{ github.sha }}
+          path: trusted
+          persist-credentials: false
+      - name: Require independent review for managed gate updates
+        env:
+          MANAGED_UPDATE_REVIEW_EVENT: ${{ github.event.action == 'labeled' && github.event.label.name == 'project-docs-upgrade-reviewed' }}
+        run: |
+          if cmp -s trusted/.github/project-docs/project-docs candidate/.github/project-docs/project-docs &&
+            cmp -s trusted/.github/workflows/project-docs.yml candidate/.github/workflows/project-docs.yml; then
+            echo "PROJECT_DOCS_MANAGED_UPDATE=false" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          if [ "$MANAGED_UPDATE_REVIEW_EVENT" != "true" ]; then
+            echo "managed project-docs files changed; remove and reapply project-docs-upgrade-reviewed after reviewing the current head" >&2
+            exit 1
+          fi
+          echo "::warning::Managed project-docs update was independently reviewed; candidate code will not execute"
+          echo "PROJECT_DOCS_MANAGED_UPDATE=true" >> "$GITHUB_ENV"
+      - name: Validate pull request with trusted gate
+        run: |
+          args=(doctor --repo candidate --strict)
+          if [ "$PROJECT_DOCS_MANAGED_UPDATE" = "true" ]; then
+            args+=(--allow-reviewed-managed-update)
+          fi
+          python3 trusted/.github/project-docs/project-docs "${args[@]}"
+"""
+CI_BLOCK_START = "<!-- project-docs: ci-start -->"
+CI_BLOCK_END = "<!-- project-docs: ci-end -->"
+PROJECT_DOCS_TEMPLATE_VARIABLES = (
+    "CI_PATHS",
+    "DEFAULT_BRANCH",
+    "DOCTOR_COMMAND",
+    "DOMAIN_NAME",
+    "GLOBAL_CORE_PATH",
+    "MODULE_NAME",
+    "MODULE_PATH",
+    "PROJECT_NAME",
+    "SOURCE_AREAS",
+    "TECHNOLOGIES",
+    "VALIDATION_COMMANDS",
+)
+PLACEHOLDER_PATTERNS = (
+    re.compile(r"<项目名>"),
+    re.compile(
+        r"\{\{(?:" + "|".join(PROJECT_DOCS_TEMPLATE_VARIABLES) + r")\}\}"
+    ),
+    re.compile(r"TODO\(project-docs\)", re.IGNORECASE),
+    re.compile(r"TBD\(project-docs\)", re.IGNORECASE),
+)
+SECRET_KEY_PATTERN = (
+    r"(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+    r"(?:gh|github)[_-]?token|private[_-]?token|secret[_-]?access[_-]?key|"
+    r"secret(?:[_-]?key)?|aws[_-]?access[_-]?key[_-]?id|password|token)"
+)
+SECRET_ASSIGNMENT = re.compile(
+    r"(?i)(?:\""
+    + SECRET_KEY_PATTERN
+    + r"\"|'"
+    + SECRET_KEY_PATTERN
+    + r"'|(?<![A-Za-z0-9_\"'])"
+    + SECRET_KEY_PATTERN
+    + r")\s*[:=]\s*(?:\"([^\"\r\n]+)\"|'([^'\r\n]+)'|([^\s#;,`\"']+))"
+)
+PRIVATE_KEY_MARKER = re.compile(
+    r"-----BEGIN (?:[A-Z0-9]+ )*PRIVATE KEY(?: BLOCK)?-----"
+)
+KNOWN_SECRET_TOKEN = re.compile(
+    r"(?i)(?:gh[pousr]_[A-Za-z0-9]{30,}|github_pat_[A-Za-z0-9_]{30,})"
+)
+MARKDOWN_ESCAPE = re.compile(r"\\([" + re.escape(string.punctuation) + r"])")
+OBVIOUS_SECRET_PLACEHOLDER = re.compile(
+    r"(?i)(?:(?:change|replace)[-_ ]?me(?:[-_ ][a-z0-9]+)*|"
+    r"(?:placeholder|example|dummy|redacted|fake)(?:[-_ ][a-z0-9]+)*|"
+    r"(?:your|insert)[-_ ][a-z0-9_-]+|not[-_ ]?a[-_ ]?real(?:[-_ ][a-z0-9]+)*|"
+    r"\$\{?[A-Z][A-Z0-9_]*\}?|(?:process\.)?env(?:iron)?(?:\[[^\]]+\]|\.[a-z0-9_]+)|"
+    r"true|false|null|none|string|integer|boolean)"
+)
+class ProjectDocsError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class Finding:
+    severity: str
+    code: str
+    path: str
+    line: int
+    message: str
+
+
+@dataclass
+class DoctorReport:
+    repo: str
+    findings: list[Finding] = field(default_factory=list)
+    changed_files: list[str] = field(default_factory=list)
+    applicable_agents: list[str] = field(default_factory=list)
+
+    def exit_code(self, strict: bool = False) -> int:
+        severities = {finding.severity for finding in self.findings}
+        if "error" in severities or (strict and "warning" in severities):
+            return 1
+        return 0
+
+
+@dataclass
+class BootstrapReport:
+    repo: str
+    created: list[str] = field(default_factory=list)
+    updated: list[str] = field(default_factory=list)
+    preserved: list[str] = field(default_factory=list)
+    notices: list[str] = field(default_factory=list)
+    dry_run: bool = False
+    doctor: DoctorReport | None = None
+
+
+@dataclass(frozen=True)
+class RepoFacts:
+    name: str
+    technologies: tuple[str, ...]
+    source_areas: tuple[str, ...]
+    validation_commands: tuple[str, ...]
+    ci_paths: tuple[str, ...]
+    current_branch: str
+    default_branch: str
+    default_base: str | None
+    has_commit: bool
+
+
+def run(
+    args: Sequence[str],
+    *,
+    cwd: Path,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    return subprocess.run(
+        args,
+        cwd=cwd,
+        check=check,
+        text=True,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+    )
+
+
+def git(root: Path, *args: str, check: bool = True) -> str:
+    result = run(("git", *args), cwd=root, check=check)
+    return result.stdout.strip()
+
+
+def resolve_repo(candidate: str) -> Path:
+    path = Path(candidate).expanduser().resolve()
+    if not path.exists():
+        raise ProjectDocsError(f"仓库路径不存在: {path}")
+    result = run(
+        ("git", "rev-parse", "--show-toplevel"), cwd=path, check=False
+    )
+    if result.returncode != 0:
+        raise ProjectDocsError(f"不是 Git 仓库: {path}")
+    return Path(result.stdout.strip()).resolve()
+
+
+def relative(root: Path, path: Path) -> str:
+    return path.absolute().relative_to(root.absolute()).as_posix()
+
+
+def has_git_marker(path: Path) -> bool:
+    try:
+        (path / ".git").lstat()
+    except FileNotFoundError:
+        return False
+    return True
+
+
+def nested_git_boundary(
+    root: Path,
+    path: Path,
+    *,
+    include_path: bool = False,
+) -> Path | None:
+    try:
+        parts = path.absolute().relative_to(root.absolute()).parts
+    except ValueError:
+        return None
+    current = root
+    ancestors = parts if include_path else parts[:-1]
+    for part in ancestors:
+        current /= part
+        if has_git_marker(current):
+            return current
+    return None
+
+
+def is_local_state_path(root: Path, path: Path) -> bool:
+    try:
+        parts = path.absolute().relative_to(root.absolute()).parts
+    except ValueError:
+        return False
+    return parts[:2] == (".agents", "local")
+
+
+def read_json(path: Path) -> dict:
+    try:
+        value = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return {}
+    return value if isinstance(value, dict) else {}
+
+
+def walk_files(root: Path, max_depth: int = 3) -> Iterable[Path]:
+    for current, dirs, files in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        depth = len(current_path.relative_to(root).parts)
+        dirs[:] = [
+            name
+            for name in dirs
+            if name not in EXCLUDED_DIRS
+            and not is_local_state_path(root, current_path / name)
+            and not (current_path / name).is_symlink()
+            and not has_git_marker(current_path / name)
+        ]
+        if depth >= max_depth:
+            dirs[:] = []
+        for name in files:
+            path = current_path / name
+            try:
+                if stat.S_ISREG(path.lstat().st_mode):
+                    yield path
+            except OSError:
+                continue
+
+
+def discover_manifests(root: Path) -> list[Path]:
+    return sorted(
+        (path for path in walk_files(root) if path.name in MANIFEST_NAMES),
+        key=lambda path: relative(root, path),
+    )
+
+
+def discover_technologies(root: Path, manifests: Sequence[Path]) -> tuple[str, ...]:
+    technologies: set[str] = set()
+    for manifest in manifests:
+        if manifest.name == "go.mod":
+            technologies.add("Go")
+        elif manifest.name == "Cargo.toml":
+            technologies.add("Rust / Cargo")
+        elif manifest.name == "pom.xml":
+            technologies.add("Java / Maven")
+            try:
+                if "spring-boot" in manifest.read_text(encoding="utf-8"):
+                    technologies.add("Spring Boot")
+            except (OSError, UnicodeDecodeError):
+                pass
+        elif manifest.name == "pyproject.toml":
+            technologies.add("Python")
+        elif manifest.name == "package.json":
+            technologies.add("Node.js")
+            package = read_json(manifest)
+            dependencies: dict[str, object] = {}
+            for key in ("dependencies", "devDependencies"):
+                value = package.get(key, {})
+                if isinstance(value, dict):
+                    dependencies.update(value)
+            framework_names = {
+                "@angular/core": "Angular",
+                "next": "Next.js",
+                "react": "React",
+                "vite": "Vite",
+                "vue": "Vue",
+            }
+            for dependency, label in framework_names.items():
+                if dependency in dependencies:
+                    technologies.add(label)
+    if any(path.name.startswith("docker-compose") for path in walk_files(root, 2)):
+        technologies.add("Docker Compose")
+    return tuple(sorted(technologies)) or ("未从受支持的 manifest 识别出技术栈",)
+
+
+def discover_source_areas(root: Path, manifests: Sequence[Path]) -> tuple[str, ...]:
+    areas: set[str] = set()
+    for child in root.iterdir():
+        if (
+            not child.is_dir()
+            or child.is_symlink()
+            or child.name.startswith(".")
+            or child.name in EXCLUDED_DIRS
+        ):
+            continue
+        if child.name.lower() in SOURCE_DIR_NAMES:
+            areas.add(child.name)
+    for manifest in manifests:
+        parts = manifest.relative_to(root).parts
+        if len(parts) > 1 and parts[0] not in EXCLUDED_DIRS:
+            areas.add(parts[0])
+    return tuple(sorted(areas))
+
+
+def package_manager(root: Path, package_dir: Path) -> str:
+    for directory in dict.fromkeys((package_dir, root)):
+        declaration = read_json(directory / "package.json").get("packageManager", "")
+        if isinstance(declaration, str):
+            match = re.match(r"^(npm|pnpm|yarn|bun)(?:@|$)", declaration)
+            if match:
+                return match.group(1)
+        locks = (
+            ("package-lock.json", "npm"),
+            ("npm-shrinkwrap.json", "npm"),
+            ("pnpm-lock.yaml", "pnpm"),
+            ("yarn.lock", "yarn"),
+            ("bun.lock", "bun"),
+            ("bun.lockb", "bun"),
+        )
+        for lockfile, manager in locks:
+            if (directory / lockfile).exists():
+                return manager
+    return "npm"
+
+
+def package_command(root: Path, package_path: Path, script: str) -> str:
+    directory = package_path.parent
+    rel_dir = relative(root, directory) if directory != root else ""
+    quoted_dir = shlex.quote(rel_dir)
+    manager = package_manager(root, directory)
+    if manager == "pnpm":
+        return f"pnpm --dir {quoted_dir} run {script}" if rel_dir else f"pnpm run {script}"
+    if manager == "yarn":
+        return f"yarn --cwd {quoted_dir} {script}" if rel_dir else f"yarn {script}"
+    if manager == "bun":
+        return f"bun --cwd {quoted_dir} run {script}" if rel_dir else f"bun run {script}"
+    return f"npm --prefix {quoted_dir} run {script}" if rel_dir else f"npm run {script}"
+
+
+def scoped_command(root: Path, directory: Path, command: str) -> str:
+    if directory == root:
+        return command
+    return f"(cd {shlex.quote(relative(root, directory))} && {command})"
+
+
+def discover_validation_commands(
+    root: Path, manifests: Sequence[Path]
+) -> tuple[str, ...]:
+    commands: list[str] = []
+    priorities = ("test", "lint", "typecheck", "check", "build")
+    ordered_manifests = sorted(
+        manifests,
+        key=lambda path: (path.parent != root, relative(root, path)),
+    )
+    for manifest in ordered_manifests:
+        directory = manifest.parent
+        if manifest.name == "package.json":
+            scripts = read_json(manifest).get("scripts", {})
+            if isinstance(scripts, dict):
+                for script in priorities:
+                    if script in scripts:
+                        commands.append(package_command(root, manifest, script))
+        elif manifest.name == "go.mod":
+            commands.append(scoped_command(root, directory, "go test ./..."))
+        elif manifest.name == "pom.xml":
+            executable = "./mvnw" if (directory / "mvnw").exists() else "mvn"
+            commands.append(scoped_command(root, directory, f"{executable} test"))
+        elif manifest.name == "Cargo.toml":
+            commands.append(scoped_command(root, directory, "cargo test"))
+        elif manifest.name == "pyproject.toml":
+            try:
+                content = manifest.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError):
+                content = ""
+            if "pytest" in content:
+                commands.append(scoped_command(root, directory, "python3 -m pytest"))
+    return tuple(dict.fromkeys(commands))[:8]
+
+
+def discover_ci_paths(root: Path) -> tuple[str, ...]:
+    paths: list[Path] = []
+    workflows = root / ".github" / "workflows"
+    if workflows.is_dir() and nested_git_boundary(
+        root, workflows, include_path=True
+    ) is None:
+        paths.extend(workflows.glob("*.yml"))
+        paths.extend(workflows.glob("*.yaml"))
+    for name in (".gitlab-ci.yml", "Jenkinsfile"):
+        path = root / name
+        if path.exists():
+            paths.append(path)
+    circle = root / ".circleci" / "config.yml"
+    if circle.exists():
+        paths.append(circle)
+    return tuple(sorted({relative(root, path) for path in paths}))
+
+
+def has_commit(root: Path) -> bool:
+    return run(("git", "rev-parse", "--verify", "HEAD"), cwd=root, check=False).returncode == 0
+
+
+def current_branch(root: Path) -> str:
+    value = git(root, "symbolic-ref", "--quiet", "--short", "HEAD", check=False)
+    return value or "(detached)"
+
+
+def default_branch(root: Path) -> tuple[str, str | None]:
+    remote = git(
+        root,
+        "symbolic-ref",
+        "--quiet",
+        "--short",
+        "refs/remotes/origin/HEAD",
+        check=False,
+    )
+    if remote.startswith("origin/"):
+        resolved = git(root, "rev-parse", "--verify", f"{remote}^{{commit}}", check=False)
+        if resolved:
+            return remote.removeprefix("origin/"), remote
+    for prefix, base_prefix in (
+        ("refs/remotes/origin/", "origin/"),
+        ("refs/heads/", ""),
+    ):
+        for candidate in ("main", "master", "develop", "trunk"):
+            ref = f"{prefix}{candidate}"
+            if run(
+                ("git", "show-ref", "--verify", "--quiet", ref),
+                cwd=root,
+                check=False,
+            ).returncode == 0:
+                return candidate, f"{base_prefix}{candidate}"
+    return "未识别", None
+
+
+def collect_facts(root: Path) -> RepoFacts:
+    manifests = discover_manifests(root)
+    remote_slug = git_remote_slug(root)
+    branch, base = default_branch(root)
+    return RepoFacts(
+        name=remote_slug.rsplit("/", 1)[-1] if remote_slug else root.name,
+        technologies=discover_technologies(root, manifests),
+        source_areas=discover_source_areas(root, manifests),
+        validation_commands=discover_validation_commands(root, manifests),
+        ci_paths=discover_ci_paths(root),
+        current_branch=current_branch(root),
+        default_branch=branch,
+        default_base=base,
+        has_commit=has_commit(root),
+    )
+
+
+def render_template(name: str, values: dict[str, str]) -> str:
+    content = (TEMPLATE_ROOT / name).read_text(encoding="utf-8")
+    content = content.replace(TEMPLATE_MARKER + "\n", "", 1)
+    variable = re.compile(r"\{\{([A-Z][A-Z0-9_]*)\}\}")
+    unresolved = sorted(
+        {match.group(1) for match in variable.finditer(content)} - values.keys()
+    )
+    if unresolved:
+        raise ProjectDocsError(f"模板 {name} 有未解析变量: {', '.join(unresolved)}")
+    return variable.sub(lambda match: values[match.group(1)], content)
+
+
+def git_remote_slug(root: Path) -> str | None:
+    remote = git(root, "remote", "get-url", "origin", check=False)
+    if not remote:
+        return None
+    path = ""
+    if "://" in remote:
+        parsed = urlsplit(remote)
+        if parsed.hostname != "github.com" or parsed.query or parsed.fragment:
+            return None
+        path = parsed.path
+    else:
+        match = re.fullmatch(
+            r"(?:[^@/\s]+@)?github\.com:(.+)",
+            remote,
+            re.IGNORECASE,
+        )
+        if not match:
+            return None
+        path = match.group(1)
+    slug = path.strip("/")
+    if slug.endswith(".git"):
+        slug = slug[:-4]
+    parts = slug.split("/")
+    if len(parts) != 2 or any(
+        not re.fullmatch(r"[A-Za-z0-9_.-]+", part) for part in parts
+    ):
+        return None
+    return slug
+
+
+def reject_control_characters(value: str, *, label: str) -> None:
+    if any(ord(character) < 32 or ord(character) == 127 for character in value):
+        raise ProjectDocsError(f"{label} 含控制字符,无法安全写入 Markdown。")
+
+
+def markdown_text(value: str, *, label: str) -> str:
+    reject_control_characters(value, label=label)
+    return re.sub(r"([\\`*_{}\[\]<>()#+.!|])", r"\\\1", value)
+
+
+def markdown_code_span(value: str, *, label: str) -> str:
+    reject_control_characters(value, label=label)
+    longest = max((len(run) for run in re.findall(r"`+", value)), default=0)
+    delimiter = "`" * (longest + 1)
+    padding = " " if value.startswith("`") or value.endswith("`") else ""
+    return f"{delimiter}{padding}{value}{padding}{delimiter}"
+
+
+def format_source_areas(areas: Sequence[str]) -> str:
+    if not areas:
+        return "- 未识别出独立源码子树;从根 manifest 和现有目录开始定位。"
+    joined = "、".join(
+        markdown_code_span(f"{area}/", label="源码目录名") for area in areas
+    )
+    return f"- 主要源码区域:{joined}。具体职责以代码和最近层 `AGENTS.md` 为准。"
+
+
+def format_commands(commands: Sequence[str]) -> str:
+    if not commands:
+        return "- 仓库未声明可可靠推导的验证命令;以现有 CI / 构建配置为准,不要臆造命令。"
+    return "\n".join(
+        f"- {markdown_code_span(command, label='验证命令')}" for command in commands
+    )
+
+
+def format_ci(paths: Sequence[str]) -> str:
+    if not paths:
+        return "- 当前未发现 CI 配置;新增门禁时同步更新本节。"
+    joined = "、".join(markdown_code_span(path, label="CI 路径") for path in paths)
+    return (
+        f"- CI 配置:{joined};CI 提供自动验证证据,"
+        "内置 project-docs workflow 只辅助检查目标为默认分支的 PR,不是合并硬门禁。"
+    )
+
+
+def managed_ci_block(paths: Sequence[str]) -> str:
+    return f"{CI_BLOCK_START}\n{format_ci(paths)}\n{CI_BLOCK_END}"
+
+
+def render_agents(facts: RepoFacts) -> str:
+    doctor_command = (
+        f"{shell_path(TOOL_ROOT / 'bin' / 'project-docs')} doctor --repo ."
+    )
+    if facts.default_base:
+        doctor_command += f" --base {shlex.quote(facts.default_base)}"
+    return render_template(
+        "AGENTS.md",
+        {
+            "PROJECT_NAME": markdown_text(facts.name, label="项目名"),
+            "TECHNOLOGIES": "、".join(facts.technologies),
+            "SOURCE_AREAS": format_source_areas(facts.source_areas),
+            "VALIDATION_COMMANDS": format_commands(facts.validation_commands),
+            "CI_PATHS": managed_ci_block(facts.ci_paths),
+            "DEFAULT_BRANCH": markdown_code_span(facts.default_branch, label="默认分支"),
+            "DOCTOR_COMMAND": markdown_code_span(doctor_command, label="doctor 命令"),
+            "GLOBAL_CORE_PATH": markdown_code_span(
+                display_path(TOOL_ROOT / "global-core.md"), label="全局规范"
+            ),
+        },
+    )
+
+
+def write_if_missing(
+    root: Path,
+    path: Path,
+    content: str,
+    report: BootstrapReport,
+    dry_run: bool,
+) -> None:
+    validate_output_path(root, path)
+    rel = relative(root, path)
+    if path.exists():
+        report.preserved.append(rel)
+        return
+    if not is_local_state_path(root, path) and git_path_ignored(root, rel):
+        raise ProjectDocsError(f"核心项目文档被 Git 忽略规则排除,无法安全创建: {rel}")
+    report.created.append(rel)
+    if dry_run:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+
+
+def sync_generated_agents_ci(
+    root: Path,
+    facts: RepoFacts,
+    report: BootstrapReport,
+    dry_run: bool,
+) -> None:
+    path = root / "AGENTS.md"
+    validate_output_path(root, path)
+    if not path.exists():
+        return
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProjectDocsError(f"无法读取 AGENTS.md: {exc}") from exc
+    if GENERATED_MARKER not in content:
+        return
+    pattern = re.compile(
+        re.escape(CI_BLOCK_START) + r"\n.*?\n" + re.escape(CI_BLOCK_END),
+        re.DOTALL,
+    )
+    replacement = managed_ci_block(facts.ci_paths)
+    updated, count = pattern.subn(lambda _: replacement, content, count=1)
+    if count != 1:
+        raise ProjectDocsError("自动生成的 AGENTS.md 缺少可安全更新的 CI 小节标记。")
+    if updated == content:
+        return
+    report.updated.append("AGENTS.md:CI")
+    if not dry_run:
+        path.write_text(updated, encoding="utf-8")
+
+
+def validate_output_path(root: Path, path: Path) -> None:
+    try:
+        parts = path.absolute().relative_to(root.absolute()).parts
+    except ValueError as exc:
+        raise ProjectDocsError(f"拒绝写入仓库外路径: {path}") from exc
+    current = root
+    for index, part in enumerate(parts):
+        current /= part
+        try:
+            mode = current.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        if stat.S_ISLNK(mode):
+            raise ProjectDocsError(f"拒绝通过符号链接写入: {relative(root, current)}")
+        if index < len(parts) - 1 and not stat.S_ISDIR(mode):
+            raise ProjectDocsError(f"输出路径的父级不是目录: {relative(root, current)}")
+        if index < len(parts) - 1 and has_git_marker(current):
+            raise ProjectDocsError(
+                f"拒绝跨入嵌套 Git 仓库写入: {relative(root, current)}"
+            )
+        if index == len(parts) - 1 and not stat.S_ISREG(mode):
+            raise ProjectDocsError(f"输出文件位置不是普通文件: {relative(root, current)}")
+    try:
+        path.parent.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError) as exc:
+        raise ProjectDocsError(f"拒绝写入仓库外路径: {path}") from exc
+
+
+def ensure_gitignore(root: Path, report: BootstrapReport, dry_run: bool) -> None:
+    validate_output_path(root, root / ".agents" / "local" / "README.md")
+    nested = root / ".agents" / ".gitignore"
+    path = nested if nested.exists() else root / ".gitignore"
+    validate_output_path(root, path)
+    try:
+        existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    except UnicodeDecodeError as exc:
+        raise ProjectDocsError(f"无法按 UTF-8 读取 {relative(root, path)}: {exc}") from exc
+    if has_repository_local_ignore(root):
+        report.preserved.append(".gitignore:.agents/local/")
+        return
+    nested_target = path == nested
+    label = ".agents/.gitignore:local/" if nested_target else ".gitignore:.agents/local/"
+    report.created.append(label)
+    if dry_run:
+        return
+    prefix = existing
+    if prefix and not prefix.endswith("\n"):
+        prefix += "\n"
+    if prefix and not prefix.endswith("\n\n"):
+        prefix += "\n"
+    managed = (
+        "# BEGIN project-docs managed\nlocal/\n# END project-docs managed\n"
+        if nested_target
+        else MANAGED_GITIGNORE
+    )
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(prefix + managed, encoding="utf-8")
+    if not has_repository_local_ignore(root):
+        raise ProjectDocsError(
+            "现有 Git 忽略例外仍会暴露 `.agents/local/`;已停止创建本地敏感目录。"
+        )
+    if not git_path_tracked(root, relative(root, path)) and git_path_ignored(
+        root, relative(root, path)
+    ):
+        raise ProjectDocsError(f"敏感目录忽略配置本身无法提交: {relative(root, path)}")
+
+
+def has_repository_local_ignore(root: Path) -> bool:
+    ignored = run(
+        ("git", "check-ignore", "--verbose", "--no-index", ".agents/local/"),
+        cwd=root,
+        check=False,
+    )
+    metadata = ignored.stdout.split("\t", 1)[0] if ignored.returncode == 0 else ""
+    try:
+        source, _, ignore_pattern = metadata.rsplit(":", 2)
+    except ValueError:
+        return False
+    source_path = Path(source)
+    if not source_path.is_absolute():
+        source_path = root / source_path
+    try:
+        source_path = source_path.resolve()
+        repository_owned = source_path.name == ".gitignore" and source_path.is_relative_to(root)
+    except (OSError, RuntimeError):
+        return False
+    if not repository_owned:
+        return False
+    source_rel = relative(root, source_path)
+    if not git_path_tracked(root, source_rel) and git_path_ignored(root, source_rel):
+        return False
+    normalized_pattern = ignore_pattern.removeprefix("/")
+    root_pattern = (
+        source_path == root / ".gitignore"
+        and normalized_pattern in {".agents/local", ".agents/local/"}
+    )
+    nested_pattern = (
+        source_path == root / ".agents" / ".gitignore"
+        and normalized_pattern in {"local", "local/"}
+    )
+    return repository_owned and (root_pattern or nested_pattern)
+
+
+def has_managed_checker(root: Path) -> bool:
+    checker = root / MANAGED_CHECKER_PATH
+    try:
+        if not stat.S_ISREG(checker.lstat().st_mode):
+            return False
+        return MANAGED_CHECKER_MARKER in checker.read_text(encoding="utf-8")
+    except (FileNotFoundError, OSError, UnicodeDecodeError):
+        return False
+
+
+def github_workflow_plan(root: Path) -> str:
+    if not git_remote_slug(root):
+        return "unavailable"
+    path = root / MANAGED_WORKFLOW_PATH
+    if not path.exists():
+        return "manage"
+    validate_output_path(root, path)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ProjectDocsError(f"无法读取 {MANAGED_WORKFLOW_PATH}: {exc}") from exc
+    if MANAGED_WORKFLOW_MARKER in content:
+        return "manage"
+    return "manage" if has_managed_checker(root) else "preserve"
+
+
+def sync_managed_file(
+    root: Path,
+    path: Path,
+    content: str,
+    marker: str,
+    report: BootstrapReport,
+    dry_run: bool,
+    *,
+    executable: bool = False,
+) -> None:
+    validate_output_path(root, path)
+    rel = relative(root, path)
+    if path.exists():
+        try:
+            existing = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProjectDocsError(f"无法读取 {rel}: {exc}") from exc
+        if existing == content:
+            needs_execute = executable and not (
+                path.lstat().st_mode
+                & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            )
+            if needs_execute:
+                report.updated.append(rel)
+                if not dry_run:
+                    path.chmod(stat.S_IMODE(path.lstat().st_mode) | stat.S_IXUSR)
+            else:
+                report.preserved.append(rel)
+            return
+        owned_workflow = rel == MANAGED_WORKFLOW_PATH and has_managed_checker(root)
+        if marker not in existing and not owned_workflow:
+            raise ProjectDocsError(f"拒绝覆盖非 project-docs 管理的文件: {rel}")
+        report.updated.append(rel)
+    else:
+        if git_path_ignored(root, rel):
+            raise ProjectDocsError(f"核心项目文档被 Git 忽略规则排除,无法安全创建: {rel}")
+        report.created.append(rel)
+    if dry_run:
+        return
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(content, encoding="utf-8")
+    if executable:
+        path.chmod(stat.S_IMODE(path.lstat().st_mode) | stat.S_IXUSR)
+
+
+def github_workflow(
+    root: Path,
+    plan: str,
+    report: BootstrapReport,
+    dry_run: bool,
+) -> bool:
+    if plan == "unavailable":
+        report.notices.append("未识别 GitHub origin,未安装 GitHub 文档门禁。")
+        return False
+    if plan == "preserve":
+        report.preserved.append(MANAGED_WORKFLOW_PATH)
+        report.notices.append(
+            f"{MANAGED_WORKFLOW_PATH} 已存在且不受 project-docs 管理,未覆盖。"
+        )
+        return False
+    checker_content = Path(__file__).read_text(encoding="utf-8")
+    sync_managed_file(
+        root,
+        root / MANAGED_CHECKER_PATH,
+        checker_content,
+        MANAGED_CHECKER_MARKER,
+        report,
+        dry_run,
+        executable=True,
+    )
+    sync_managed_file(
+        root,
+        root / MANAGED_WORKFLOW_PATH,
+        MANAGED_WORKFLOW_CONTENT,
+        MANAGED_WORKFLOW_MARKER,
+        report,
+        dry_run,
+    )
+    report.notices.append(REMOTE_GATE_NOTICE)
+    return True
+
+
+def declared_protected_branches(root: Path) -> set[str]:
+    path = root / "AGENTS.md"
+    if not path.is_file() or path.is_symlink():
+        return set()
+    try:
+        content = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return set()
+    protected: set[str] = set()
+    declaration = re.compile(
+        r"(?:受保护(?:的)?(?:主线|分支)|(?:生产|默认|集成|发布)(?:事实)?主线|"
+        r"(?:protected|production|default|integration|release)\s+branch(?:es)?)"
+        r"\s*(?:是|为|包括|包含|:|：|=|is|are|includes?|contains?)\s*(?::|：)?\s*",
+        re.IGNORECASE,
+    )
+    lines = content.splitlines()
+    values_to_parse: list[str] = []
+    for index, line in enumerate(lines):
+        for match in declaration.finditer(line):
+            values = re.split(
+                r"(?:，|,)?\s*(?:而?不是|not\b)",
+                line[match.end() :],
+                maxsplit=1,
+                flags=re.IGNORECASE,
+            )[0]
+            if values.strip():
+                values_to_parse.append(values)
+                continue
+            cursor = index + 1
+            while cursor < len(lines) and not lines[cursor].strip():
+                cursor += 1
+            while cursor < len(lines):
+                item = re.match(r"^\s*(?:[-*+]|\d+[.)])\s+(.+?)\s*$", lines[cursor])
+                if not item:
+                    break
+                values_to_parse.append(item.group(1))
+                cursor += 1
+    for values in values_to_parse:
+        values = re.split(r"[。；;]", values, maxsplit=1)[0].strip()
+        if values.endswith("."):
+            values = values[:-1].rstrip()
+        for segment in re.split(
+            r"(?:\s*(?:，|,|、|\band\b|及|和)\s*|\s+/\s+)",
+            values,
+            flags=re.IGNORECASE,
+        ):
+            candidate = declared_branch_candidate(root, segment)
+            if not candidate or candidate.casefold() in NON_BRANCH_PROSE_WORDS:
+                continue
+            valid = run(
+                ("git", "check-ref-format", "--branch", candidate),
+                cwd=root,
+                check=False,
+            )
+            if valid.returncode == 0:
+                protected.add(candidate)
+    return protected
+
+
+def branch_ref_exists(root: Path, branch: str) -> bool:
+    if not branch:
+        return False
+    for ref in (f"refs/heads/{branch}", f"refs/remotes/origin/{branch}"):
+        if run(
+            ("git", "show-ref", "--verify", "--quiet", ref),
+            cwd=root,
+            check=False,
+        ).returncode == 0:
+            return True
+    return False
+
+
+def unwrap_leading_markdown_emphasis(root: Path, values: str) -> str:
+    literal = values.split(maxsplit=1)[0].strip("`") if values else ""
+    if branch_ref_exists(root, literal):
+        return values
+    for wrapper in ("**", "__", "*", "_"):
+        if not values.startswith(wrapper):
+            continue
+        end = values.find(wrapper, len(wrapper))
+        if end == -1:
+            continue
+        remainder = values[end + len(wrapper) :]
+        if remainder and not remainder[0].isspace():
+            continue
+        return values[len(wrapper) : end] + remainder
+    return values
+
+
+def declared_branch_candidate(root: Path, value: str) -> str:
+    normalized = value.strip()
+    if not normalized:
+        return ""
+    normalized = unwrap_leading_markdown_emphasis(root, normalized)
+    link = re.match(r"^\[(?:`([^`]+)`|([^\]]+))\]\([^)]+\)", normalized)
+    if link:
+        normalized = unwrap_leading_markdown_emphasis(
+            root,
+            next(candidate for candidate in link.groups() if candidate).strip(),
+        )
+    if normalized.startswith("`"):
+        end = normalized.find("`", 1)
+        return normalized[1:end] if end != -1 else ""
+    return normalized.split(maxsplit=1)[0]
+
+
+def is_protected_checkout(root: Path, facts: RepoFacts) -> bool:
+    protected = PROTECTED_BRANCHES | {facts.default_branch} | declared_protected_branches(root)
+    return facts.has_commit and (
+        facts.current_branch == "(detached)" or facts.current_branch in protected
+    )
+
+
+def preflight_bootstrap_outputs(root: Path, workflow_plan: str) -> None:
+    core_paths = [root / "AGENTS.md", root / "CLAUDE.md", root / "GEMINI.md"]
+    if workflow_plan == "manage":
+        core_paths.extend(
+            (root / MANAGED_CHECKER_PATH, root / MANAGED_WORKFLOW_PATH)
+        )
+    for path in core_paths:
+        validate_output_path(root, path)
+        rel = relative(root, path)
+        if not git_path_tracked(root, rel) and git_path_ignored(root, rel):
+            raise ProjectDocsError(
+                f"核心项目文档被 Git 忽略规则排除,无法安全创建或更新: {rel}"
+            )
+    checker = root / MANAGED_CHECKER_PATH
+    if workflow_plan == "manage" and checker.exists():
+        try:
+            checker_content = checker.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProjectDocsError(f"无法读取 {MANAGED_CHECKER_PATH}: {exc}") from exc
+        if MANAGED_CHECKER_MARKER not in checker_content:
+            raise ProjectDocsError(
+                f"拒绝覆盖非 project-docs 管理的文件: {MANAGED_CHECKER_PATH}"
+            )
+    if not has_repository_local_ignore(root):
+        nested = root / ".agents" / ".gitignore"
+        ignore_path = nested if nested.exists() else root / ".gitignore"
+        validate_output_path(root, ignore_path)
+        rel = relative(root, ignore_path)
+        if ignore_path.exists():
+            try:
+                ignore_path.read_text(encoding="utf-8")
+            except UnicodeDecodeError as exc:
+                raise ProjectDocsError(f"无法按 UTF-8 读取 {rel}: {exc}") from exc
+        if not git_path_tracked(root, rel) and git_path_ignored(root, rel):
+            raise ProjectDocsError(f"敏感目录忽略配置本身无法提交: {rel}")
+    validate_output_path(root, root / ".agents" / "local" / "README.md")
+    agents = root / "AGENTS.md"
+    if agents.exists():
+        try:
+            agents_content = agents.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            raise ProjectDocsError(f"无法读取 AGENTS.md: {exc}") from exc
+        if GENERATED_MARKER in agents_content and (
+            agents_content.count(CI_BLOCK_START) != 1
+            or agents_content.count(CI_BLOCK_END) != 1
+        ):
+            raise ProjectDocsError(
+                "自动生成的 AGENTS.md 缺少可安全更新的 CI 小节标记。"
+            )
+
+
+def is_vendored_checker() -> bool:
+    parts = Path(__file__).resolve().parts
+    return tuple(parts[-3:]) == (".github", "project-docs", "project-docs")
+
+
+def upstream_project_docs() -> Path:
+    """Locate the trusted upstream checker for a vendored bootstrap copy."""
+    configured = os.environ.get("PROJECT_DOCS_SOURCE")
+    if configured:
+        candidates: tuple[Path, ...] = (Path(configured).expanduser(),)
+    else:
+        found = shutil.which("project-docs")
+        candidates = tuple(
+            candidate
+            for candidate in (
+                Path(found) if found else None,
+                install_root() / "bin" / "project-docs",
+            )
+            if candidate is not None
+        )
+    current = Path(__file__).resolve()
+    for candidate in candidates:
+        try:
+            if candidate.is_file() and candidate.resolve() != current:
+                return candidate.resolve()
+        except (OSError, RuntimeError):
+            continue
+    raise ProjectDocsError(
+        "vendored bootstrap 需要上游 project-docs;设置 PROJECT_DOCS_SOURCE 为可信的 "
+        "bin/project-docs 路径,或把本仓安装到 "
+        f"{display_path(install_root() / 'bin' / 'project-docs')}。"
+    )
+
+
+def delegate_vendored_bootstrap(argv: Sequence[str]) -> int:
+    source = upstream_project_docs()
+    return subprocess.run(
+        (sys.executable, str(source), *argv),
+        check=False,
+    ).returncode
+
+
+def bootstrap(root: Path, *, dry_run: bool) -> BootstrapReport:
+    if any(
+        not (TEMPLATE_ROOT / name).is_file()
+        for name in ("AGENTS.md", "CLAUDE.md", "GEMINI.md")
+    ):
+        raise ProjectDocsError(
+            "project-docs 模板资产不完整,无法运行 bootstrap。"
+        )
+    facts = collect_facts(root)
+    if not dry_run and is_protected_checkout(root, facts):
+        raise ProjectDocsError(
+            f"拒绝在受保护主线 {facts.current_branch} 写入;请先创建专用 worktree / 任务分支。"
+        )
+    workflow_plan = github_workflow_plan(root)
+    preflight_bootstrap_outputs(root, workflow_plan)
+    report = BootstrapReport(repo=str(root), dry_run=dry_run)
+    managed_workflow = workflow_plan == "manage"
+    if managed_workflow and MANAGED_WORKFLOW_PATH not in facts.ci_paths:
+        facts = RepoFacts(
+            name=facts.name,
+            technologies=facts.technologies,
+            source_areas=facts.source_areas,
+            validation_commands=facts.validation_commands,
+            ci_paths=tuple(sorted((*facts.ci_paths, MANAGED_WORKFLOW_PATH))),
+            current_branch=facts.current_branch,
+            default_branch=facts.default_branch,
+            default_base=facts.default_base,
+            has_commit=facts.has_commit,
+        )
+    agents_content = render_agents(facts)
+    github_workflow(root, workflow_plan, report, dry_run)
+    write_if_missing(root, root / "AGENTS.md", agents_content, report, dry_run)
+    sync_generated_agents_ci(root, facts, report, dry_run)
+    write_if_missing(
+        root,
+        root / "CLAUDE.md",
+        (TEMPLATE_ROOT / "CLAUDE.md").read_text(encoding="utf-8"),
+        report,
+        dry_run,
+    )
+    write_if_missing(
+        root,
+        root / "GEMINI.md",
+        (TEMPLATE_ROOT / "GEMINI.md").read_text(encoding="utf-8"),
+        report,
+        dry_run,
+    )
+    ensure_gitignore(root, report, dry_run)
+    local_readme = (
+        "# .agents/local/\n\n"
+        "本目录只放真实主机、IP、凭据路径和其它本地敏感值,不得提交。\n"
+    )
+    write_if_missing(
+        root,
+        root / ".agents" / "local" / "README.md",
+        local_readme,
+        report,
+        dry_run,
+    )
+    if not dry_run:
+        report.doctor = doctor(root, base=None)
+    return report
+
+
+def knowledge_markdown_files(root: Path) -> tuple[list[Path], set[Path]]:
+    files: set[Path] = set()
+    for current, dirs, names in os.walk(root, followlinks=False):
+        current_path = Path(current)
+        traversable: list[str] = []
+        for name in dirs:
+            candidate = current_path / name
+            if (
+                name in EXCLUDED_DIRS
+                or is_local_state_path(root, candidate)
+                or candidate.is_symlink()
+                or (candidate / ".git").exists()
+            ):
+                continue
+            traversable.append(name)
+        dirs[:] = traversable
+        for context_name in ("AGENTS.md", "GEMINI.md"):
+            if context_name in names:
+                files.add(current_path / context_name)
+        if current_path == root / "docs" / "ai":
+            files.update(current_path / name for name in names if name.endswith(".md"))
+    for bridge_name in ("CLAUDE.md", "GEMINI.md"):
+        bridge = root / bridge_name
+        try:
+            bridge.lstat()
+        except FileNotFoundError:
+            pass
+        else:
+            files.add(bridge)
+    gemini_context = {path for path in files if path.name == "GEMINI.md"}
+    pending = list(gemini_context)
+    while pending:
+        path = pending.pop()
+        if not is_regular_repo_file(root, path):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for imported in gemini_imported_files(root, path, content):
+            if imported not in gemini_context:
+                gemini_context.add(imported)
+                pending.append(imported)
+    files.update(gemini_context)
+    pending = list(files)
+    while pending:
+        path = pending.pop()
+        if not is_regular_repo_file(root, path):
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            continue
+        for linked in linked_markdown_files(root, path, content):
+            if linked not in files:
+                files.add(linked)
+                pending.append(linked)
+    return sorted(files, key=lambda path: relative(root, path)), gemini_context
+
+
+def gemini_import_targets(content: str) -> Iterable[tuple[int, str]]:
+    for line_number, line in markdown_source_lines(content):
+        source = strip_inline_code(line)
+        for match in re.finditer(r"(?:^|[ \t])@([^\s]+)", source):
+            yield line_number, match.group(1)
+
+
+def normalized_local_path(path: Path) -> Path:
+    return Path(os.path.normpath(path))
+
+
+def gemini_imported_files(
+    root: Path,
+    path: Path,
+    content: str,
+) -> Iterable[Path]:
+    for _, target in gemini_import_targets(content):
+        resolved = resolve_local_path(
+            root,
+            path,
+            target,
+            repository_relative=False,
+        )
+        resolved = normalized_local_path(resolved)
+        if is_local_state_path(root, resolved):
+            continue
+        if is_regular_repo_file(root, resolved):
+            yield resolved
+
+
+def linked_markdown_files(root: Path, path: Path, content: str) -> Iterable[Path]:
+    raw_targets: list[tuple[str, bool]] = []
+    for _, source_line in markdown_source_lines(content):
+        line = strip_inline_code(source_line)
+        raw_targets.extend((raw_target, False) for _, raw_target in markdown_links(line))
+        definition = re.match(r"^ {0,3}\[[^\]]+\]:\s*(.+)$", line)
+        if definition:
+            raw_targets.append((definition.group(1), False))
+        raw_targets.extend(
+            (target, True)
+            for target in inline_code_spans(source_line)
+            if is_markdown_path_candidate(target)
+        )
+    for raw_target, repository_relative in raw_targets:
+        encoded_target = markdown_link_target(raw_target)
+        if (
+            not encoded_target
+            or encoded_target.startswith(("#", "/", "$", "~", "//"))
+            or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", encoded_target)
+        ):
+            continue
+        encoded_path = split_uri_suffix(encoded_target)
+        clean = MARKDOWN_ESCAPE.sub(r"\1", unquote(encoded_path))
+        if not clean or Path(clean).suffix.casefold() != ".md":
+            continue
+        resolved = resolve_local_path(
+            root,
+            path,
+            clean,
+            repository_relative=repository_relative,
+        )
+        resolved = normalized_local_path(resolved)
+        if is_local_state_path(root, resolved):
+            continue
+        if is_regular_repo_file(root, resolved):
+            yield resolved.resolve()
+            continue
+        try:
+            is_link = stat.S_ISLNK(resolved.lstat().st_mode)
+            resolved.resolve().relative_to(root.resolve())
+        except (FileNotFoundError, OSError, RuntimeError, ValueError):
+            continue
+        if is_link:
+            yield resolved
+
+
+def is_markdown_path_candidate(raw_target: str) -> bool:
+    encoded_target = markdown_link_target(raw_target)
+    if (
+        not encoded_target
+        or encoded_target.startswith(("#", "/", "$", "~", "//"))
+        or re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", encoded_target)
+    ):
+        return False
+    encoded_path = split_uri_suffix(encoded_target)
+    clean = MARKDOWN_ESCAPE.sub(r"\1", unquote(encoded_path))
+    return (
+        bool(clean)
+        and not re.search(r"[*\[\]{}<>]", clean)
+        and Path(clean).suffix.casefold() == ".md"
+    )
+
+
+def is_regular_repo_file(root: Path, path: Path) -> bool:
+    path = normalized_local_path(path)
+    try:
+        if not stat.S_ISREG(path.lstat().st_mode):
+            return False
+        if nested_git_boundary(root, path) is not None:
+            return False
+        path.resolve().relative_to(root.resolve())
+    except (FileNotFoundError, OSError, RuntimeError, ValueError):
+        return False
+    return True
+
+
+def git_path_tracked(root: Path, rel: str) -> bool:
+    return run(
+        ("git", "ls-files", "--error-unmatch", "--", rel),
+        cwd=root,
+        check=False,
+    ).returncode == 0
+
+
+def git_path_ignored(root: Path, rel: str) -> bool:
+    return run(
+        ("git", "check-ignore", "--quiet", "--no-index", "--", rel),
+        cwd=root,
+        check=False,
+    ).returncode == 0
+
+
+def add_finding(
+    report: DoctorReport,
+    severity: str,
+    code: str,
+    path: str,
+    line: int,
+    message: str,
+) -> None:
+    report.findings.append(Finding(severity, code, path, line, message))
+
+
+def first_nonempty_line(content: str) -> str:
+    return next((line.strip() for line in content.splitlines() if line.strip()), "")
+
+
+def is_template_file(root: Path, path: Path) -> bool:
+    try:
+        parents = path.relative_to(root).parts[:-1]
+    except ValueError:
+        return False
+    if not any(part in {"template", "templates", "project-template"} for part in parents):
+        return False
+    try:
+        return TEMPLATE_MARKER in path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return False
+
+
+def is_version_like_ipv4(line: str, match: re.Match[str]) -> bool:
+    prefix = line[: match.start()]
+    suffix = line[match.end() :]
+    if re.search(r"(?i)\b(?:v|version)[:\s]*$", prefix):
+        return True
+    return bool(
+        re.search(r"(?i)(?:linux|kernel)\s*$", prefix)
+        and re.match(
+            r"(?i)-(?:microsoft(?:-standard)?-wsl(?:1|2)?|generic|amd64|lts|"
+            r"azure|aws|gcp|oracle|rt(?:[0-9]+)?|arch[0-9]+-[0-9]+)"
+            r"(?=$|[\s)`\],.;:])",
+            suffix,
+        )
+    )
+
+
+def check_required_files(
+    root: Path,
+    report: DoctorReport,
+    *,
+    allow_reviewed_managed_update: bool = False,
+) -> None:
+    agents = root / "AGENTS.md"
+    claude = root / "CLAUDE.md"
+    gemini = root / "GEMINI.md"
+    try:
+        agents_is_regular = stat.S_ISREG(agents.lstat().st_mode)
+    except FileNotFoundError:
+        agents_is_regular = False
+    if not agents_is_regular:
+        add_finding(report, "error", "missing-agents", "AGENTS.md", 1, "缺少普通文件类型的项目知识地图。")
+    for rel in (".agents", ".agents/local"):
+        local_path = root / rel
+        try:
+            mode = local_path.lstat().st_mode
+        except FileNotFoundError:
+            continue
+        except (OSError, RuntimeError):
+            add_finding(
+                report,
+                "error",
+                "unsafe-local-state-path",
+                rel,
+                1,
+                "本地敏感目录无法安全解析,可能包含符号链接环或其它特殊路径。",
+            )
+            continue
+        try:
+            inside_repo = root.resolve() in (local_path.resolve(), *local_path.resolve().parents)
+        except (OSError, RuntimeError):
+            inside_repo = False
+        if not stat.S_ISDIR(mode) or local_path.is_symlink() or not inside_repo:
+            add_finding(
+                report,
+                "error",
+                "unsafe-local-state-path",
+                rel,
+                1,
+                "本地敏感目录必须是仓库内的真实目录,不能是符号链接或其它文件类型。",
+            )
+    try:
+        claude_is_regular = stat.S_ISREG(claude.lstat().st_mode)
+    except FileNotFoundError:
+        claude_is_regular = False
+    if not claude_is_regular:
+        add_finding(report, "error", "missing-claude-bridge", "CLAUDE.md", 1, "缺少 Claude 到 AGENTS.md 的薄桥接。")
+    else:
+        try:
+            content = claude.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            add_finding(report, "error", "unreadable-claude", "CLAUDE.md", 1, str(exc))
+        else:
+            if first_nonempty_line(content) != "@AGENTS.md":
+                add_finding(
+                    report,
+                    "error",
+                    "invalid-claude-bridge",
+                    "CLAUDE.md",
+                    1,
+                    "首个非空行必须是 @AGENTS.md;共享事实不得锁进工具专属入口。",
+                )
+            if len(content.splitlines()) > 20:
+                add_finding(
+                    report,
+                    "warning",
+                    "large-claude-bridge",
+                    "CLAUDE.md",
+                    1,
+                    "CLAUDE.md 超过 20 行,应只保留桥接和极少工具专属内容。",
+                )
+    required_artifacts = ["AGENTS.md", "CLAUDE.md", "GEMINI.md"]
+    try:
+        gemini_mode = gemini.lstat().st_mode
+    except FileNotFoundError:
+        gemini_mode = None
+    if gemini_mode is None:
+        add_finding(
+            report,
+            "error",
+            "missing-gemini-bridge",
+            "GEMINI.md",
+            1,
+            "缺少 Gemini 到 AGENTS.md 的薄桥接。",
+        )
+    else:
+        if not stat.S_ISREG(gemini_mode):
+            add_finding(
+                report,
+                "error",
+                "unsafe-gemini-bridge",
+                "GEMINI.md",
+                1,
+                "Gemini 桥接必须是仓库内普通文件,不能是符号链接、目录或其它文件类型。",
+            )
+        else:
+            try:
+                content = gemini.read_text(encoding="utf-8")
+            except (OSError, UnicodeDecodeError) as exc:
+                add_finding(report, "error", "unreadable-gemini", "GEMINI.md", 1, str(exc))
+            else:
+                if first_nonempty_line(content) not in {"@AGENTS.md", "@./AGENTS.md"}:
+                    add_finding(
+                        report,
+                        "error",
+                        "invalid-gemini-bridge",
+                        "GEMINI.md",
+                        1,
+                        "首个非空行必须导入 AGENTS.md;共享事实不得锁进工具专属入口。",
+                    )
+                if len(content.splitlines()) > 20:
+                    add_finding(
+                        report,
+                        "warning",
+                        "large-gemini-bridge",
+                        "GEMINI.md",
+                        1,
+                        "GEMINI.md 超过 20 行,应只保留桥接和极少工具专属内容。",
+                    )
+    workflow_path = root / MANAGED_WORKFLOW_PATH
+    try:
+        workflow_mode = workflow_path.lstat().st_mode
+    except FileNotFoundError:
+        workflow_mode = None
+    workflow_is_regular = workflow_mode is not None and is_regular_repo_file(
+        root, workflow_path
+    )
+    if workflow_mode is not None and not workflow_is_regular:
+        add_finding(
+            report,
+            "error",
+            "unsafe-managed-workflow",
+            MANAGED_WORKFLOW_PATH,
+            1,
+            "项目文档 workflow 必须是仓库内普通文件,不能是符号链接、目录或其它文件类型。",
+        )
+    workflow_content = ""
+    if workflow_is_regular:
+        required_artifacts.append(MANAGED_WORKFLOW_PATH)
+        try:
+            workflow_content = workflow_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            workflow_content = ""
+    checker_path = root / MANAGED_CHECKER_PATH
+    checker_is_regular = is_regular_repo_file(root, checker_path)
+    checker_content = ""
+    if checker_is_regular:
+        try:
+            checker_content = checker_path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            checker_content = ""
+    managed_state = allow_reviewed_managed_update or (
+        MANAGED_WORKFLOW_MARKER in workflow_content
+        or MANAGED_CHECKER_MARKER in checker_content
+    )
+    if managed_state:
+        required_artifacts.extend((MANAGED_WORKFLOW_PATH, MANAGED_CHECKER_PATH))
+        if not workflow_is_regular:
+            add_finding(
+                report,
+                "error",
+                "missing-managed-workflow",
+                MANAGED_WORKFLOW_PATH,
+                1,
+                "已接入项目文档门禁,但固定 workflow 缺失或不是普通文件。",
+            )
+        elif MANAGED_WORKFLOW_MARKER not in workflow_content:
+            add_finding(
+                report,
+                "error",
+                "invalid-managed-workflow",
+                MANAGED_WORKFLOW_PATH,
+                1,
+                "项目文档 workflow 缺少稳定受管标记,不能确认升级后的所有权。",
+            )
+        if not checker_is_regular:
+            add_finding(
+                report,
+                "error",
+                "missing-managed-checker",
+                MANAGED_CHECKER_PATH,
+                1,
+                "自包含项目文档门禁缺少仓库内普通 checker 文件。",
+            )
+        else:
+            if not (
+                checker_path.lstat().st_mode
+                & (stat.S_IXUSR | stat.S_IXGRP | stat.S_IXOTH)
+            ):
+                add_finding(
+                    report,
+                    "error",
+                    "non-executable-managed-checker",
+                    MANAGED_CHECKER_PATH,
+                    1,
+                    "项目内 project-docs checker 必须保留可执行位,确保文档声明的直接入口可用。",
+                )
+            if MANAGED_CHECKER_MARKER not in checker_content:
+                add_finding(
+                    report,
+                    "error",
+                    "invalid-managed-checker",
+                    MANAGED_CHECKER_PATH,
+                    1,
+                    "项目文档 checker 缺少受管标记,不能确认其来源。",
+                )
+            source_checker = Path(__file__).resolve()
+            if source_checker != checker_path.resolve():
+                try:
+                    source_content = source_checker.read_text(encoding="utf-8")
+                except (OSError, UnicodeDecodeError):
+                    source_content = checker_content
+                if (
+                    source_content != checker_content
+                    and not allow_reviewed_managed_update
+                ):
+                    add_finding(
+                        report,
+                        "error",
+                        "stale-managed-checker",
+                        MANAGED_CHECKER_PATH,
+                        1,
+                        "目标仓库的自包含 checker 落后于当前 project-docs;重新运行 bootstrap 同步。",
+                    )
+        if (
+            workflow_is_regular
+            and workflow_content != MANAGED_WORKFLOW_CONTENT
+            and not allow_reviewed_managed_update
+        ):
+            add_finding(
+                report,
+                "error",
+                "stale-managed-workflow",
+                MANAGED_WORKFLOW_PATH,
+                1,
+                "受管工作流与 project-docs 固定模板不一致;重新运行 bootstrap 同步。",
+            )
+    required_artifacts = list(dict.fromkeys(required_artifacts))
+    for rel in required_artifacts:
+        if (
+            (root / rel).exists()
+            and not git_path_tracked(root, rel)
+            and git_path_ignored(root, rel)
+        ):
+            add_finding(
+                report,
+                "error",
+                "ignored-core-artifact",
+                rel,
+                1,
+                "核心项目文档被 Git 忽略且尚未跟踪,其他协作者和 CI 无法获得它。",
+            )
+    for rel in ("docs", "docs/ai"):
+        path = root / rel
+        try:
+            is_link = stat.S_ISLNK(path.lstat().st_mode)
+        except FileNotFoundError:
+            is_link = False
+        if is_link:
+            add_finding(
+                report,
+                "error",
+                "unsafe-knowledge-directory",
+                rel,
+                1,
+                "知识文档目录不能是符号链接。",
+            )
+    if not has_repository_local_ignore(root):
+        add_finding(
+            report,
+            "error",
+            "local-secrets-not-ignored",
+            ".gitignore",
+            1,
+            "`.agents/local/` 必须由仓库内 `.gitignore` 忽略,不能只依赖本机 excludes 配置。",
+        )
+    tracked_local = git(root, "ls-files", "--", ".agents/local", check=False)
+    if tracked_local:
+        add_finding(
+            report,
+            "error",
+            "tracked-local-secret",
+            ".agents/local",
+            1,
+            "`.agents/local/` 下存在已被 Git 跟踪的文件,必须先移出版本控制。",
+        )
+
+
+def markdown_link_target(raw: str) -> str:
+    value = raw.strip()
+    if value.startswith("<") and ">" in value:
+        return value[1 : value.index(">")]
+    return value.split(maxsplit=1)[0] if value else ""
+
+
+def strip_inline_code(line: str) -> str:
+    result = list(line)
+    cursor = 0
+    while cursor < len(line):
+        start = line.find("`", cursor)
+        if start == -1:
+            break
+        delimiter_end = start
+        while delimiter_end < len(line) and line[delimiter_end] == "`":
+            delimiter_end += 1
+        delimiter = line[start:delimiter_end]
+        end = line.find(delimiter, delimiter_end)
+        if end == -1:
+            cursor = delimiter_end
+            continue
+        closing_end = end + len(delimiter)
+        result[start:closing_end] = " " * (closing_end - start)
+        cursor = closing_end
+    return "".join(result)
+
+
+def inline_code_spans(line: str) -> Iterable[str]:
+    cursor = 0
+    while cursor < len(line):
+        start = line.find("`", cursor)
+        if start == -1:
+            return
+        delimiter_end = start
+        while delimiter_end < len(line) and line[delimiter_end] == "`":
+            delimiter_end += 1
+        delimiter = line[start:delimiter_end]
+        end = line.find(delimiter, delimiter_end)
+        if end == -1:
+            return
+        yield line[delimiter_end:end].strip()
+        cursor = end + len(delimiter)
+
+
+def is_markdown_escaped(line: str, index: int) -> bool:
+    backslashes = 0
+    cursor = index - 1
+    while cursor >= 0 and line[cursor] == "\\":
+        backslashes += 1
+        cursor -= 1
+    return backslashes % 2 == 1
+
+
+def markdown_label_end(line: str, start: int) -> int | None:
+    depth = 1
+    cursor = start + 1
+    while cursor < len(line):
+        if line[cursor] == "\\":
+            cursor += 2
+            continue
+        if line[cursor] == "[":
+            depth += 1
+        elif line[cursor] == "]":
+            depth -= 1
+            if depth == 0:
+                return cursor
+        cursor += 1
+    return None
+
+
+def markdown_label_tokens(line: str) -> Iterable[tuple[str, int, int]]:
+    cursor = 0
+    while cursor < len(line):
+        start = line.find("[", cursor)
+        if start == -1:
+            return
+        end = markdown_label_end(line, start)
+        if end is None:
+            return
+        if is_markdown_escaped(line, start):
+            cursor = end + 1
+            if cursor < len(line) and line[cursor] == "[":
+                reference_end = markdown_label_end(line, cursor)
+                cursor = reference_end + 1 if reference_end is not None else cursor + 1
+            continue
+        yield line[start + 1 : end], start, end
+        cursor = end + 1
+
+
+def markdown_links(line: str) -> Iterable[tuple[str, str]]:
+    cursor = 0
+    while cursor < len(line):
+        start = line.find("[", cursor)
+        if start == -1:
+            return
+        if is_markdown_escaped(line, start):
+            cursor = start + 1
+            continue
+        label_depth = 1
+        label_end = start + 1
+        while label_end < len(line):
+            if line[label_end] == "\\":
+                label_end += 2
+                continue
+            if line[label_end] == "[":
+                label_depth += 1
+            elif line[label_end] == "]":
+                label_depth -= 1
+                if label_depth == 0:
+                    break
+            label_end += 1
+        if label_end >= len(line) or label_end + 1 >= len(line) or line[label_end + 1] != "(":
+            cursor = start + 1
+            continue
+        depth = 1
+        destination_start = label_end + 2
+        index = destination_start
+        while index < len(line):
+            character = line[index]
+            if character == "\\":
+                index += 2
+                continue
+            if character == "(":
+                depth += 1
+            elif character == ")":
+                depth -= 1
+                if depth == 0:
+                    yield line[start + 1 : label_end], line[destination_start:index]
+                    cursor = index + 1
+                    break
+            index += 1
+        else:
+            cursor = start + 1
+
+
+def markdown_source_lines(content: str) -> Iterable[tuple[int, str]]:
+    fence: tuple[str, int] | None = None
+    for line_number, line in enumerate(content.splitlines(), 1):
+        if fence:
+            character, minimum = fence
+            closing = re.match(
+                rf"^ {{0,3}}({re.escape(character)}{{{minimum},}})[ \t]*$",
+                line,
+            )
+            if closing:
+                fence = None
+            continue
+        opening = re.match(r"^ {0,3}(`{3,}|~{3,})(.*)$", line)
+        if opening:
+            delimiter = opening.group(1)
+            fence = (delimiter[0], len(delimiter))
+            continue
+        if line.startswith(("    ", "\t")):
+            continue
+        yield line_number, line
+
+
+def markdown_noncode_lines(content: str) -> Iterable[tuple[int, str]]:
+    for line_number, line in markdown_source_lines(content):
+        yield line_number, strip_inline_code(line)
+
+
+def normalized_reference_label(label: str) -> str:
+    return " ".join(label.split()).casefold()
+
+
+def check_link_target(
+    root: Path,
+    path: Path,
+    raw_target: str,
+    line_number: int,
+    report: DoctorReport,
+    *,
+    allow_template_placeholders: bool,
+    repository_relative: bool = False,
+) -> None:
+    encoded_target = markdown_link_target(raw_target)
+    target = MARKDOWN_ESCAPE.sub(r"\1", unquote(encoded_target))
+    if allow_template_placeholders and re.search(r"\{\{[A-Z][A-Z0-9_]*\}\}", target):
+        return
+    if not encoded_target or encoded_target.startswith(("#", "/")):
+        return
+    if encoded_target.startswith("//") or re.match(
+        r"^[A-Za-z][A-Za-z0-9+.-]*:", encoded_target
+    ):
+        return
+    encoded_path = split_uri_suffix(encoded_target)
+    clean = MARKDOWN_ESCAPE.sub(r"\1", unquote(encoded_path))
+    if not clean or clean.startswith(("$", "~")):
+        return
+    resolved = resolve_local_path(
+        root,
+        path,
+        clean,
+        repository_relative=repository_relative,
+    )
+    resolved = normalized_local_path(resolved)
+    if is_local_state_path(root, resolved):
+        return
+    if not resolved.exists():
+        add_finding(
+            report,
+            "error",
+            "broken-local-link",
+            relative(root, path),
+            line_number,
+            f"本地链接不存在: {target}",
+        )
+        return
+    try:
+        resolved.resolve().relative_to(root.resolve())
+    except (OSError, RuntimeError, ValueError):
+        add_finding(
+            report,
+            "error",
+            "unsafe-local-link",
+            relative(root, path),
+            line_number,
+            f"本地链接解析到仓库外: {target}",
+        )
+
+
+def resolve_local_path(
+    root: Path,
+    source: Path,
+    target: str,
+    *,
+    repository_relative: bool,
+) -> Path:
+    candidate = Path(target)
+    if candidate.is_absolute():
+        return candidate
+    source_candidate = source.parent / candidate
+    if not repository_relative or target.startswith(("./", "../")):
+        return source_candidate
+    repository_candidate = root / candidate
+    if path_lexists(repository_candidate) or not path_lexists(source_candidate):
+        return repository_candidate
+    return source_candidate
+
+
+def path_lexists(path: Path) -> bool:
+    try:
+        path.lstat()
+    except (FileNotFoundError, OSError):
+        return False
+    return True
+
+
+def split_uri_suffix(target: str) -> str:
+    index = 0
+    while index < len(target):
+        if target[index] == "\\":
+            index += 2
+            continue
+        if target[index] in "#?":
+            return target[:index]
+        index += 1
+    return target
+
+
+def check_links(
+    root: Path,
+    path: Path,
+    content: str,
+    report: DoctorReport,
+    *,
+    allow_template_placeholders: bool = False,
+) -> None:
+    lines = list(markdown_noncode_lines(content))
+    for line_number, source_line in markdown_source_lines(content):
+        for raw_target in inline_code_spans(source_line):
+            if not is_markdown_path_candidate(raw_target):
+                continue
+            check_link_target(
+                root,
+                path,
+                raw_target,
+                line_number,
+                report,
+                allow_template_placeholders=allow_template_placeholders,
+                repository_relative=True,
+            )
+    definitions: dict[str, tuple[str, int]] = {}
+    definition_lines: set[int] = set()
+    for line_number, line in lines:
+        definition = re.match(r"^ {0,3}\[([^\]]+)\]:\s*(.+)$", line)
+        if not definition:
+            continue
+        label = normalized_reference_label(definition.group(1))
+        definitions.setdefault(label, (definition.group(2), line_number))
+        definition_lines.add(line_number)
+
+    used_references: dict[str, int] = {}
+    explicit_references: dict[str, int] = {}
+    for line_number, line in lines:
+        if line_number in definition_lines:
+            continue
+        for label, raw_target in markdown_links(line):
+            check_link_target(
+                root,
+                path,
+                raw_target,
+                line_number,
+                report,
+                allow_template_placeholders=allow_template_placeholders,
+            )
+        tokens = list(markdown_label_tokens(line))
+        tokens_by_start = {start: (label, end) for label, start, end in tokens}
+        consumed: set[int] = set()
+        for display_label, start, end in tokens:
+            if start in consumed:
+                continue
+            reference = tokens_by_start.get(end + 1)
+            if reference:
+                reference_label, _ = reference
+                label = normalized_reference_label(reference_label or display_label)
+                explicit_references.setdefault(label, line_number)
+                used_references.setdefault(label, line_number)
+                consumed.add(end + 1)
+                continue
+            if end + 1 < len(line) and line[end + 1] == "(":
+                continue
+            label = normalized_reference_label(display_label)
+            if label in definitions:
+                used_references.setdefault(label, line_number)
+
+    for label, line_number in explicit_references.items():
+        if label not in definitions:
+            add_finding(
+                report,
+                "error",
+                "undefined-link-reference",
+                relative(root, path),
+                line_number,
+                f"引用式链接没有定义: {label}",
+            )
+    for label in sorted(used_references.keys() & definitions.keys()):
+        raw_target, line_number = definitions[label]
+        check_link_target(
+            root,
+            path,
+            raw_target,
+            line_number,
+            report,
+            allow_template_placeholders=allow_template_placeholders,
+        )
+
+
+def check_content(
+    root: Path,
+    path: Path,
+    content: str,
+    report: DoctorReport,
+    *,
+    is_gemini_context: bool,
+) -> None:
+    rel = relative(root, path)
+    lines = content.splitlines()
+    has_template_marker = TEMPLATE_MARKER in content
+    is_template = has_template_marker and is_template_file(root, path)
+    if path == root / "AGENTS.md" and GENERATED_MARKER in content:
+        expected = managed_ci_block(discover_ci_paths(root))
+        if expected not in content:
+            add_finding(
+                report,
+                "error",
+                "stale-generated-ci-map",
+                rel,
+                1,
+                "自动生成地图的 CI 小节与当前仓库配置不一致;重新运行 bootstrap 同步。",
+            )
+    if has_template_marker and not is_template:
+        marker_line = next(
+            (number for number, line in enumerate(lines, 1) if TEMPLATE_MARKER in line),
+            1,
+        )
+        add_finding(
+            report,
+            "error",
+            "template-marker-in-active-doc",
+            rel,
+            marker_line,
+            "模板标记只能存在于模板资产目录,活动知识文档必须先完成渲染。",
+        )
+    if path.name == "GEMINI.md" and path != root / "GEMINI.md":
+        imports = list(gemini_import_targets(content))
+        bridge = imports[0][1] if imports else ""
+        resolved_bridge = (
+            normalized_local_path(
+                resolve_local_path(
+                    root,
+                    path,
+                    bridge,
+                    repository_relative=False,
+                )
+            )
+            if bridge
+            else path / "AGENTS.md"
+        )
+        allowed_bridges: set[Path] = set()
+        current = path.parent
+        while root == current or root in current.parents:
+            allowed_bridges.add(current / "AGENTS.md")
+            if current == root:
+                break
+            current = current.parent
+        if (
+            not bridge
+            or resolved_bridge.name != "AGENTS.md"
+            or resolved_bridge not in allowed_bridges
+            or not is_regular_repo_file(root, resolved_bridge)
+        ):
+            add_finding(
+                report,
+                "error",
+                "invalid-gemini-bridge",
+                rel,
+                1,
+                "嵌套 GEMINI.md 的首个导入必须指向同一目录链上的 AGENTS.md。",
+            )
+    for number, line in enumerate(lines, 1):
+        if not is_template:
+            prose = strip_inline_code(line)
+            for pattern in PLACEHOLDER_PATTERNS:
+                if pattern.search(prose):
+                    add_finding(report, "error", "template-placeholder", rel, number, "残留项目模板占位符。")
+                    break
+        secrets = SECRET_ASSIGNMENT.finditer(line)
+        has_real_secret = False
+        for secret in secrets:
+            value = next((candidate for candidate in secret.groups() if candidate), "")
+            if (
+                re.search(r"[A-Za-z0-9]", value)
+                and not OBVIOUS_SECRET_PLACEHOLDER.fullmatch(value)
+            ):
+                has_real_secret = True
+                break
+        if PRIVATE_KEY_MARKER.search(line) or KNOWN_SECRET_TOKEN.search(line) or has_real_secret:
+            add_finding(report, "error", "high-confidence-secret", rel, number, "知识文档疑似包含真实凭据。")
+        for ip_match in re.finditer(
+            r"(?<![0-9.])(?:[0-9]{1,3}\.){3}[0-9]{1,3}(?![0-9.])",
+            line,
+        ):
+            raw_ip = ip_match.group(0)
+            if is_version_like_ipv4(line, ip_match):
+                continue
+            try:
+                address = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                continue
+            if address.is_global:
+                add_finding(report, "warning", "public-ip", rel, number, f"知识文档含公网 IP {raw_ip};确认是否应移入 .agents/local/。")
+        for ip_match in re.finditer(
+            r"\[([0-9A-Fa-f:.]+)\]|(?<![0-9A-Fa-f:.])([0-9A-Fa-f:.]*:[0-9A-Fa-f:.]+)(?![0-9A-Fa-f:.])",
+            line,
+        ):
+            raw_ip = next(candidate for candidate in ip_match.groups() if candidate)
+            if raw_ip.count(":") < 2:
+                continue
+            try:
+                address = ipaddress.ip_address(raw_ip)
+            except ValueError:
+                continue
+            if address.version == 6 and address.is_global:
+                add_finding(
+                    report,
+                    "warning",
+                    "public-ip",
+                    rel,
+                    number,
+                    f"知识文档含公网 IP {raw_ip};确认是否应移入 .agents/local/。",
+                )
+    if path.name == "AGENTS.md":
+        if path == root / "AGENTS.md" and len(lines) < 20:
+            add_finding(report, "warning", "thin-root-map", rel, 1, "根 AGENTS.md 少于 20 行;确认是否缺少项目边界、验证或模块路由。")
+        limit = 200 if path == root / "AGENTS.md" else 150
+        if len(lines) > limit:
+            add_finding(report, "warning", "large-agent-map", rel, 1, f"地图共 {len(lines)} 行(建议不超过 {limit});检查是否应下沉领域细节。")
+    elif path.parent == root / "docs" / "ai" and len(lines) > 300:
+        add_finding(report, "warning", "large-domain-doc", rel, 1, f"领域文档共 {len(lines)} 行;检查是否混合多个独立职责。")
+    check_links(root, path, content, report, allow_template_placeholders=is_template)
+    if is_gemini_context:
+        check_gemini_imports(root, path, content, report)
+
+
+def check_gemini_imports(
+    root: Path,
+    path: Path,
+    content: str,
+    report: DoctorReport,
+) -> None:
+    for line_number, target in gemini_import_targets(content):
+        resolved = resolve_local_path(
+            root,
+            path,
+            target,
+            repository_relative=False,
+        )
+        resolved = normalized_local_path(resolved)
+        if not path_lexists(resolved):
+            add_finding(
+                report,
+                "error",
+                "broken-gemini-import",
+                relative(root, path),
+                line_number,
+                f"Gemini 导入不存在: {target}",
+            )
+            continue
+        if not is_regular_repo_file(root, resolved):
+            add_finding(
+                report,
+                "error",
+                "unsafe-gemini-import",
+                relative(root, path),
+                line_number,
+                f"Gemini 导入必须指向仓库内普通文本文件: {target}",
+            )
+            continue
+        try:
+            resolved.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError):
+            add_finding(
+                report,
+                "error",
+                "unsafe-gemini-import",
+                relative(root, path),
+                line_number,
+                f"Gemini 导入必须是可按 UTF-8 读取的文本文件: {target}",
+            )
+
+
+def check_orphan_domain_docs(
+    root: Path,
+    contents: dict[Path, str],
+    report: DoctorReport,
+) -> None:
+    agents_content = "\n".join(
+        content
+        for path, content in contents.items()
+        if path.name == "AGENTS.md"
+    )
+    docs_root = root / "docs" / "ai"
+    for path in (
+        path
+        for path in contents
+        if path.parent == docs_root and path.suffix == ".md"
+    ):
+        rel = relative(root, path)
+        if rel not in agents_content:
+            add_finding(report, "warning", "orphan-domain-doc", rel, 1, "领域文档未被任何 AGENTS.md 知识地图路由。")
+
+
+def changed_files(root: Path, base: str | None, report: DoctorReport) -> None:
+    if not base:
+        return
+    verified = git(root, "rev-parse", "--verify", f"{base}^{{commit}}", check=False)
+    if not verified:
+        add_finding(report, "error", "invalid-base", ".", 1, f"无法解析任务基线: {base}")
+        return
+    merge_base = git(root, "merge-base", "HEAD", verified, check=False)
+    if not merge_base:
+        add_finding(
+            report,
+            "error",
+            "missing-merge-base",
+            ".",
+            1,
+            f"任务分支与基线没有共同祖先: {base}",
+        )
+        return
+    result = run(
+        ("git", "diff", "--no-renames", "--name-only", "-z", merge_base, "--"),
+        cwd=root,
+        check=False,
+    )
+    if result.returncode != 0:
+        add_finding(report, "error", "diff-failed", ".", 1, result.stderr.strip() or "git diff 失败")
+        return
+    untracked = git(root, "ls-files", "-z", "--others", "--exclude-standard", check=False)
+    files = {path for path in (result.stdout + untracked).split("\0") if path}
+    report.changed_files = sorted(files)
+    applicable: set[str] = set()
+    root_agents = root / "AGENTS.md"
+    for rel in report.changed_files:
+        if is_regular_repo_file(root, root_agents):
+            applicable.add("AGENTS.md")
+        current = (root / rel).parent
+        while current != root and root in current.parents:
+            candidate = current / "AGENTS.md"
+            if is_regular_repo_file(root, candidate) and not is_template_file(root, candidate):
+                applicable.add(relative(root, candidate))
+            current = current.parent
+    report.applicable_agents = sorted(applicable)
+
+
+def doctor(
+    root: Path,
+    *,
+    base: str | None,
+    allow_reviewed_managed_update: bool = False,
+) -> DoctorReport:
+    report = DoctorReport(repo=str(root))
+    check_required_files(
+        root,
+        report,
+        allow_reviewed_managed_update=allow_reviewed_managed_update,
+    )
+    files, gemini_context = knowledge_markdown_files(root)
+    contents: dict[Path, str] = {}
+    for path in files:
+        if not is_regular_repo_file(root, path):
+            add_finding(
+                report,
+                "error",
+                "unsafe-knowledge-path",
+                relative(root, path),
+                1,
+                "知识文档必须是仓库内的普通文件,不能是符号链接或其它特殊文件。",
+            )
+            continue
+        try:
+            content = path.read_text(encoding="utf-8")
+        except (OSError, UnicodeDecodeError) as exc:
+            add_finding(report, "error", "unreadable-markdown", relative(root, path), 1, str(exc))
+            continue
+        contents[path] = content
+        check_content(
+            root,
+            path,
+            content,
+            report,
+            is_gemini_context=path in gemini_context,
+        )
+    check_orphan_domain_docs(root, contents, report)
+    changed_files(root, base, report)
+    report.findings.sort(key=lambda item: (item.severity != "error", item.path, item.line, item.code))
+    return report
+
+
+def report_payload(report: BootstrapReport | DoctorReport) -> dict:
+    return asdict(report)
+
+
+def print_doctor(report: DoctorReport) -> None:
+    for finding in report.findings:
+        print(
+            f"{finding.severity.upper()} [{finding.code}] "
+            f"{finding.path}:{finding.line} {finding.message}"
+        )
+    if report.changed_files:
+        print("Changed files:")
+        for path in report.changed_files:
+            print(f"  {path}")
+    if report.applicable_agents:
+        print("Applicable AGENTS.md:")
+        for path in report.applicable_agents:
+            print(f"  {path}")
+    if not report.findings:
+        print("OK project-docs doctor: no findings")
+
+
+def print_bootstrap(report: BootstrapReport) -> None:
+    verb = "Would create" if report.dry_run else "Created"
+    for path in report.created:
+        print(f"{verb}: {path}")
+    update_verb = "Would update" if report.dry_run else "Updated"
+    for path in report.updated:
+        print(f"{update_verb}: {path}")
+    for path in report.preserved:
+        print(f"Preserved: {path}")
+    for notice in report.notices:
+        print(f"NOTICE: {notice}")
+    if report.doctor:
+        print_doctor(report.doctor)
+
+
+def parser() -> argparse.ArgumentParser:
+    result = argparse.ArgumentParser(
+        prog="project-docs",
+        description="初始化并检查跨工具项目知识地图。",
+    )
+    result.add_argument("--version", action="version", version="project-docs 1.0.0")
+    commands = result.add_subparsers(dest="command", required=True)
+    bootstrap_parser = commands.add_parser("bootstrap", help="建立最小项目知识地图。")
+    bootstrap_parser.add_argument("--repo", default=".")
+    bootstrap_parser.add_argument("--dry-run", action="store_true")
+    bootstrap_parser.add_argument("--format", choices=("human", "json"), default="human")
+    doctor_parser = commands.add_parser("doctor", help="检查项目知识地图。")
+    doctor_parser.add_argument("--repo", default=".")
+    doctor_parser.add_argument("--base")
+    doctor_parser.add_argument("--strict", action="store_true")
+    doctor_parser.add_argument(
+        "--allow-reviewed-managed-update",
+        action="store_true",
+        help=argparse.SUPPRESS,
+    )
+    doctor_parser.add_argument("--format", choices=("human", "json"), default="human")
+    return result
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    raw_argv = list(argv) if argv is not None else sys.argv[1:]
+    args = parser().parse_args(raw_argv)
+    try:
+        if args.command == "bootstrap" and is_vendored_checker():
+            return delegate_vendored_bootstrap(raw_argv)
+        root = resolve_repo(args.repo)
+        if args.command == "bootstrap":
+            report = bootstrap(root, dry_run=args.dry_run)
+            if args.format == "json":
+                print(json.dumps(report_payload(report), ensure_ascii=False, indent=2))
+            else:
+                print_bootstrap(report)
+            if args.dry_run or report.doctor is None:
+                return 0
+            return report.doctor.exit_code()
+        report = doctor(
+            root,
+            base=args.base,
+            allow_reviewed_managed_update=args.allow_reviewed_managed_update,
+        )
+        if args.format == "json":
+            print(json.dumps(report_payload(report), ensure_ascii=False, indent=2))
+        else:
+            print_doctor(report)
+        return report.exit_code(strict=args.strict)
+    except (OSError, RuntimeError, ProjectDocsError, subprocess.SubprocessError) as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
